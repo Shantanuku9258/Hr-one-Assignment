@@ -1,26 +1,92 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+A FastAPI application backed by MongoDB for employee management, attendance punch-in/punch-out, and attendance analytics.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Tech Stack
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+- **Backend:** Python, FastAPI
+- **Database:** MongoDB 6.0+
+- **Driver:** PyMongo
+- **Validation:** Pydantic
 
-## Local setup
+## Prerequisites
+
+- Python 3.10+
+- MongoDB 6.0+ running locally or through MongoDB Atlas
+- Git
+
+## Local Setup
+
+### 1. Clone the repository
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
+git clone https://github.com/Shantanuku9258/Hr-one-Assignment.git
+cd Hr-one-Assignment
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+### 2. Create and activate a virtual environment
+
+**Windows PowerShell:**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+**macOS/Linux:**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Configure environment variables
+
+Create a `.env` file in the repository root:
+
+```env
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=attendance_db
+```
+
+Update these values if your MongoDB instance uses a different connection string or database name. Do not commit `.env` or any credentials.
+
+### 5. Start the API
+
+```bash
+uvicorn app.main:app --port 8000
+```
+
+The API will be available at:
+
+- **Base URL:** http://127.0.0.1:8000
+- **Swagger UI:** http://127.0.0.1:8000/docs
+- **ReDoc:** http://127.0.0.1:8000/redoc
+
+## API Documentation
+
+Use the Swagger UI at `/docs` to inspect available endpoints and send test requests.
+
+## Project Structure
+
+```text
+Hr-one-Assignment/
+├── app/
+│   ├── __init__.py
+│   └── main.py
+├── requirements.txt
+├── README.md
+├── REVIEW.md
+├── DECISIONS.md
+└── .gitignore
+```
+
+## Submission Notes
+
+This repository contains the application entry point, dependencies, and assignment documentation. Keep environment files, credentials, and other secrets out of version control.
