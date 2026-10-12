@@ -26,15 +26,22 @@ load_dotenv()
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
+
 db.employees.create_index(
     [("emp_code", 1)],
     unique=True,
-    name="emp_code_unique_idx",
 )
+
 
 db.employees.create_index(
     [("department", 1), ("joined_on", 1)],
     name="department_joined_on_idx",
+)
+
+# Supports headcount queries that filter only by joined_on.
+db.employees.create_index(
+    [("joined_on", 1)],
+    name="joined_on_idx",
 )
 
 db.attendance_logs.create_index(
@@ -138,6 +145,17 @@ def compute_overtime(
 
 
 
+def normalize_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize BSON/Python datetimes to aware UTC at whole-second precision."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.replace(microsecond=0)
+
+
 def to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
     if value is None:
         return None
@@ -204,8 +222,10 @@ class EmployeeIn(BaseModel):
     @classmethod
     def validate_joined_on(cls, value):
         try:
-            date.fromisoformat(value)
-        except ValueError:
+            parsed = date.fromisoformat(value)
+            if parsed.isoformat() != value:
+                raise ValueError
+        except (TypeError, ValueError):
             raise ValueError("joined_on must be a valid YYYY-MM-DD date")
         return value
 
@@ -330,7 +350,7 @@ def create_employee(body: EmployeeIn):
         raise HTTPException(409, "emp_code already exists")
 
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc)
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
 
     try:
         db.employees.insert_one(doc)
@@ -340,7 +360,7 @@ def create_employee(body: EmployeeIn):
     doc.pop("_id", None)
 
     # Convert datetime to milliseconds for the API response
-    doc["created_at"] = int(doc["created_at"].timestamp() * 1000)
+    doc["created_at"] = to_epoch_ms(doc["created_at"])
 
     return doc
 
@@ -354,13 +374,13 @@ def list_employees(
 ):
     if page < 1:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail="page must be at least 1",
         )
 
     if page_size < 1 or page_size > 100:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail="page_size must be between 1 and 100",
         )
 
@@ -404,13 +424,13 @@ def list_attendance(
 ):
     if page < 1:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail="page must be at least 1",
         )
 
     if page_size < 1 or page_size > 100:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail="page_size must be between 1 and 100",
         )
     
@@ -426,17 +446,20 @@ def list_attendance(
                     raise ValueError
             except ValueError:
                 raise HTTPException(
-                    status_code=400,
+                    status_code=422,
                     detail=f"{field_name} must use YYYY-MM-DD format",
                 )
 
     # Ensure the start date is not after the end date.
     if date_from and date_to and date_from > date_to:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail="date_from must not be after date_to",
         )
 
+    allowed_statuses = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
+    if status is not None and status not in allowed_statuses:
+        raise HTTPException(status_code=422, detail="Invalid attendance status")
 
     query = {}
 
@@ -480,7 +503,7 @@ def list_attendance(
 
             for field, change in entry.get("changes", {}).items():
                 if field in ("punch_in", "punch_out") and isinstance(change, dict):
-                    for key in ("old", "new"):
+                    for key in ("from", "to"):
                         if change.get(key) is not None:
                             change[key] = to_epoch_ms(change[key])
 
@@ -762,6 +785,9 @@ def correct_attendance(
             ).replace(microsecond=0)
 
         old_value = record.get(field)
+        if field in ("punch_in", "punch_out"):
+            old_value = normalize_utc(old_value)
+            new_value = normalize_utc(new_value)
 
         if old_value != new_value:
             updated_fields[field] = new_value
@@ -775,8 +801,8 @@ def correct_attendance(
     # 6. Determine the final status and punch times.
     effective = {**record, **updated_fields}
     final_status = effective.get("status")
-    punch_in_time = effective.get("punch_in")
-    punch_out_time = effective.get("punch_out")
+    punch_in_time = normalize_utc(effective.get("punch_in"))
+    punch_out_time = normalize_utc(effective.get("punch_out"))
 
     # ABSENT and LEAVE must not have punch times.
     if final_status in {"ABSENT", "LEAVE"}:
@@ -891,16 +917,12 @@ def correct_attendance(
     audit_changes = {}
 
     for field, new_value in updated_fields.items():
-        if field not in record:
-            continue
-
         old_value = record.get(field)
+        if field in ("punch_in", "punch_out"):
+            old_value = normalize_utc(old_value)
+            new_value = normalize_utc(new_value)
 
         if old_value != new_value:
-            if field in ("punch_in", "punch_out"):
-                old_value = to_epoch_ms(old_value)
-                new_value = to_epoch_ms(new_value)
-
             audit_changes[field] = {
                 "from": old_value,
                 "to": new_value,
@@ -916,10 +938,15 @@ def correct_attendance(
     }
 
     # 10. Update the record and append exactly one history entry.
+    history_filter = (
+        {"history": {"$exists": False}}
+        if "history" not in record
+        else {"history": record["history"]}
+    )
     result = db.attendance_logs.update_one(
         {
             "_id": record["_id"],
-            "history": record.get("history", []),
+            **history_filter,
         },
         {
             "$set": updated_fields,
@@ -1360,17 +1387,16 @@ def department_summary(
                 "avg_work_hours": {
                     "$cond": [
                         {"$gt": ["$work_hours_count", 0]},
-                        {
-                            "$round": [
-                                {
-                                    "$divide": [
-                                        "$total_work_hours",
-                                        "$work_hours_count",
-                                    ]
-                                },
-                                2,
-                            ]
-                        },
+                        {"$divide": [
+                            {"$floor": {"$add": [
+                                {"$multiply": [
+                                    {"$divide": ["$total_work_hours", "$work_hours_count"]},
+                                    100,
+                                ]},
+                                0.5,
+                            ]}},
+                            100,
+                        ]},
                         None,
                     ]
                 }
@@ -1725,22 +1751,19 @@ def department_trend(
                                 },
                             ]
                         },
-                        {
-                            "$round": [
-                                {
-                                    "$divide": [
+                        {"$divide": [
+                            {"$floor": {"$add": [
+                                {"$multiply": [
+                                    {"$divide": [
                                         "$present_count",
-                                        {
-                                            "$arrayElemAt": [
-                                                "$headcount_data.count",
-                                                0,
-                                            ]
-                                        },
-                                    ]
-                                },
-                                4,
-                            ]
-                        },
+                                        {"$arrayElemAt": ["$headcount_data.count", 0]},
+                                    ]},
+                                    10000,
+                                ]},
+                                0.5,
+                            ]}},
+                            10000,
+                        ]},
                         None,
                     ]
                 },
@@ -1767,7 +1790,19 @@ def department_trend(
                 "present_count": 1,
                 "late_count": 1,
                 "attendance_rate": 1,
-                "moving_avg_7d": {"$round": ["$moving_avg_7d", 4]},
+                "moving_avg_7d": {
+                    "$cond": [
+                        {"$ne": ["$moving_avg_7d", None]},
+                        {"$divide": [
+                            {"$floor": {"$add": [
+                                {"$multiply": ["$moving_avg_7d", 10000]},
+                                0.5,
+                            ]}},
+                            10000,
+                        ]},
+                        None,
+                    ]
+                },
             }
         },
         {"$sort": {"date": 1}},
@@ -1847,8 +1882,23 @@ def explain_endpoint(
         if emp_code:
             query["emp_code"] = emp_code
 
+        allowed_statuses = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
+        if status is not None and status not in allowed_statuses:
+            raise HTTPException(status_code=422, detail="Invalid attendance status")
         if status:
             query["status"] = status
+
+        for date_value, field_name in ((date_from, "date_from"), (date_to, "date_to")):
+            if date_value is not None:
+                try:
+                    parsed = date.fromisoformat(date_value)
+                    if parsed.isoformat() != date_value:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"{field_name} must use YYYY-MM-DD format",
+                    )
 
         if date_from or date_to:
             query["date"] = {}
@@ -2178,17 +2228,16 @@ def explain_endpoint(
                     "avg_work_hours": {
                         "$cond": [
                             {"$gt": ["$work_hours_count", 0]},
-                            {
-                                "$round": [
-                                    {
-                                        "$divide": [
-                                            "$total_work_hours",
-                                            "$work_hours_count",
-                                        ]
-                                    },
-                                    2,
-                                ]
-                            },
+                            {"$divide": [
+                                {"$floor": {"$add": [
+                                    {"$multiply": [
+                                        {"$divide": ["$total_work_hours", "$work_hours_count"]},
+                                        100,
+                                    ]},
+                                    0.5,
+                                ]}},
+                                100,
+                            ]},
                             None,
                         ]
                     }
@@ -2228,6 +2277,8 @@ def explain_endpoint(
 
     # 4. Explain late leaderboard analytics.
     if endpoint == "late_leaderboard":
+        if limit < 1 or limit > 50:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 50")
         month_start, month_end = get_month_range(month)
 
         if limit < 1 or limit > 50:
@@ -2535,22 +2586,19 @@ def explain_endpoint(
                                     },
                                 ]
                             },
-                            {
-                                "$round": [
-                                    {
-                                        "$divide": [
+                            {"$divide": [
+                                {"$floor": {"$add": [
+                                    {"$multiply": [
+                                        {"$divide": [
                                             "$present_count",
-                                            {
-                                                "$arrayElemAt": [
-                                                    "$headcount_data.count",
-                                                    0,
-                                                ]
-                                            },
-                                        ]
-                                    },
-                                    4,
-                                ]
-                            },
+                                            {"$arrayElemAt": ["$headcount_data.count", 0]},
+                                        ]},
+                                        10000,
+                                    ]},
+                                    0.5,
+                                ]}},
+                                10000,
+                            ]},
                             None,
                         ]
                     },
@@ -2576,7 +2624,19 @@ def explain_endpoint(
                     "present_count": 1,
                     "late_count": 1,
                     "attendance_rate": 1,
-                    "moving_avg_7d": {"$round": ["$moving_avg_7d", 4]},
+                    "moving_avg_7d": {
+                    "$cond": [
+                        {"$ne": ["$moving_avg_7d", None]},
+                        {"$divide": [
+                            {"$floor": {"$add": [
+                                {"$multiply": ["$moving_avg_7d", 10000]},
+                                0.5,
+                            ]}},
+                            10000,
+                        ]},
+                        None,
+                    ]
+                },
                 }
             },
             {"$sort": {"date": 1}},
@@ -2603,17 +2663,4 @@ def explain_endpoint(
         detail="Explanation for this endpoint is not implemented yet",
     )
 
-
-
-
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
 
